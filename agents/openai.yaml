@@ -1,0 +1,4 @@
+interface:
+  display_name: "維基文庫發佈"
+  short_description: "將已校對 Markdown、原文 PDF、全部圖片及表格完整發佈到中文維基文庫"
+  default_prompt: "使用 $wikisource-publish，將呢個 Markdown 同原文 PDF 連同全部圖片及表格發佈到中文維基文庫。"

@@ -232,6 +232,117 @@ class PublishWorkflowTests(unittest.TestCase):
         commons.upload.assert_not_called()
         wiki.edit.assert_called_once()
 
+    def test_subpage_header_links_and_optional_license(self):
+        self.md.write_text("# 測試書/憲法講義\n\n## 第一章\n\n正文內容。\n", encoding="utf-8")
+        metadata = {
+            "title": "測試書/憲法講義",
+            "author": "測試作者",
+            "section": "憲法講義",
+            "previous": {"page": "../政治學", "label": "政治學 | 總論"},
+            "next": "../行政法學",
+            "license_commons": "{{PD-scan|PD-US-expired}}",
+        }
+        self.metadata_path.write_text(json.dumps(metadata, ensure_ascii=False))
+        job = self.make_job()
+        commons, wiki = self.fake_clients(job)
+        args = argparse.Namespace(markdown=str(self.md), pdf="File:Existing source.pdf",
+                                  metadata=str(self.metadata_path), title=None,
+                                  workdir=str(self.work), offline_validation=True)
+        with patch.object(workflow, "clients", return_value=(commons, wiki)), patch.object(workflow, "emit"):
+            workflow.prepare(args)
+        pub = (self.work / "publication.wikitext").read_text(encoding="utf-8")
+        self.assertIn(" | title = [[測試書]]\n", pub)
+        self.assertIn(" | section = 憲法講義\n", pub)
+        self.assertIn(" | previous = [[../政治學|政治學 &#124; 總論]]\n", pub)
+        self.assertIn(" | next = [[../行政法學]]\n", pub)
+        self.assertNotIn("{{PD|1800|1900}}", pub)
+        prep = json.loads((self.work / "preparation.json").read_text(encoding="utf-8"))
+        self.assertEqual(prep["layout_mode"], "subpage")
+        self.assertTrue(any("under 15 KB" in msg for msg in prep["layout_advisories"]))
+
+    def test_subpage_rejects_categories_and_subpages_list(self):
+        for bad in ({"categories": ["分類甲"]}, {"subpages": [{"page": "/子頁", "label": "子頁"}]}):
+            with self.subTest(bad=bad):
+                meta = {"author": "測試作者", "section": "第一冊", "license_commons": "{{PD-scan}}", **bad}
+                with self.assertRaises(workflow.PublicationError):
+                    workflow.validate_metadata_structure("測試書/第一冊", meta)
+
+    def test_root_page_requires_substantive_prose_and_renders_toc_and_categories(self):
+        self.md.write_text("# 測試書\n\n", encoding="utf-8")
+        metadata = {
+            "title": "測試書",
+            "author": "測試作者",
+            "year": 1910,
+            "license_wikisource": "{{PD-old}}",
+            "license_commons": "{{PD-scan}}",
+            "categories": ["測試叢書", "Category:1910年"],
+            "subpages": [
+                {"page": "/第一編", "label": "第一編", "summary": "含緒論與通則。"},
+                {"page": "測試書/第二編", "label": "第二編"},
+            ],
+        }
+        self.metadata_path.write_text(json.dumps(metadata, ensure_ascii=False))
+        job = self.make_job()
+        commons, wiki = self.fake_clients(job)
+        args = argparse.Namespace(markdown=str(self.md), pdf="File:Existing source.pdf",
+                                  metadata=str(self.metadata_path), title=None,
+                                  workdir=str(self.work), offline_validation=True)
+        with patch.object(workflow, "clients", return_value=(commons, wiki)), patch.object(workflow, "emit"):
+            with self.assertRaisesRegex(workflow.PublicationError, "substantive"):
+                workflow.prepare(args)
+
+        self.md.write_text("# 測試書\n\n## 序言\n\n本書成於宣統二年。\n", encoding="utf-8")
+        with patch.object(workflow, "clients", return_value=(commons, wiki)), patch.object(workflow, "emit"):
+            workflow.prepare(args)
+        pub = (self.work / "publication.wikitext").read_text(encoding="utf-8")
+        self.assertIn("== 目錄 ==\n* [[/第一編|第一編]]：含緒論與通則。\n* [[測試書/第二編|第二編]]", pub)
+        self.assertIn("{{PD-old}}\n\n[[Category:測試叢書]]\n[[Category:1910年]]", pub)
+        prep = json.loads((self.work / "preparation.json").read_text(encoding="utf-8"))
+        self.assertEqual(prep["layout_mode"], "root_with_subpages")
+
+        prepared_job = json.loads((self.work / "job.json").read_text(encoding="utf-8"))
+        prepared_job["metadata"]["subpages"][0]["summary"] = "被篡改"
+        with self.assertRaisesRegex(workflow.PublicationError, "prepare again"):
+            workflow.checked_package(self.work, prepared_job)
+
+    def test_subpages_rejects_external_or_duplicate_targets(self):
+        for bad in (
+            [{"page": "他書/第一章", "label": "第一章"}],
+            [{"page": "/第一章", "label": "甲"}, {"page": "/第一章", "label": "乙"}],
+            [{"page": "../別頁", "label": "別頁"}],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(workflow.PublicationError):
+                workflow.validate_subpages(bad, "測試書")
+
+    def test_duplicate_h2_and_large_single_page_advisories(self):
+        self.md.write_text("# 測試書\n\n## 第一編\n\n甲。\n\n## 第一編\n\n乙。\n", encoding="utf-8")
+        job = self.make_job()
+        commons, wiki = self.fake_clients(job)
+        args = argparse.Namespace(markdown=str(self.md), pdf="File:Existing source.pdf",
+                                  metadata=str(self.metadata_path), title=None,
+                                  workdir=str(self.work), offline_validation=False)
+        with patch.object(workflow, "clients", return_value=(commons, wiki)), patch.object(workflow, "emit"):
+            workflow.prepare(args)
+        report = json.loads((self.work / "conversion-validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["duplicate_h2_headings"], ["第一編"])
+        prep = json.loads((self.work / "preparation.json").read_text(encoding="utf-8"))
+        self.assertTrue(any("Repeated H2" in msg for msg in prep["layout_advisories"]))
+
+        _, _, big_advisories = workflow.layout_diagnostics(job, "字" * 100_005, {"headings": []})
+        self.assertTrue(any("300 KB" in msg for msg in big_advisories))
+
+    def test_default_edit_summaries_by_layout_mode(self):
+        job = self.make_job()
+        self.assertIn("建立全文", workflow.default_edit_summary(job, True))
+        self.assertIn("更新全文", workflow.default_edit_summary(job, False))
+        job["metadata"]["section"] = "第一冊"
+        self.assertIn("建立分頁正文", workflow.default_edit_summary(job, True))
+        job["metadata"].pop("section")
+        job["metadata"]["subpages"] = [{"page": "/第一冊", "label": "第一冊"}]
+        self.assertIn("建立作品根頁", workflow.default_edit_summary(job, True))
+        job["metadata"]["edit_summary"] = "自訂摘要"
+        self.assertEqual(workflow.default_edit_summary(job, True), "自訂摘要")
+
 
 if __name__ == "__main__":
     unittest.main()
